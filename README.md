@@ -26,6 +26,22 @@ npm run dev
 - `npm run test` — unit-тесты расчётов
 - `npm run lint` — ESLint
 
+## Песочница и деплой
+
+| Ветка | Куда деплоится | URL |
+|-------|----------------|-----|
+| `sandbox` | Preview (песочница) | `https://denis120-80-git-sandbox-dzianis1.vercel.app` |
+| `main` | Production | `https://denis.tuttech.net` |
+
+**Workflow:**
+
+1. Переключись на `sandbox`: `git checkout sandbox`
+2. Делай доработки, коммить и пушь: `git push`
+3. Vercel автоматически соберёт preview — ссылка появится в GitHub (Deployments) или в [Vercel Dashboard](https://vercel.com/dzianis1/denis120-80)
+4. Когда всё ок — merge `sandbox` → `main` (через PR или локально) → production обновится сам
+
+Локально: `npm run dev` на `http://localhost:3000`.
+
 ## MCP
 
 См. [docs/MCP-SETUP.md](docs/MCP-SETUP.md).
