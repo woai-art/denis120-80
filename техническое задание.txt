@@ -1,0 +1,689 @@
+# Техническое задание v2
+## Denis120→80 — персональное web-приложение для похудения
+
+**Версия:** 2.0  
+**Дата:** 10.07.2026  
+**Пользователь:** Денис (45 лет, 172 см, 120 → 80 кг)  
+**Домен:** `tuttech.net` (поддомен `denis.tuttech.net` или корень — на выбор при деплое)  
+**Стек:** Next.js 15 + TypeScript + Supabase + Vercel + Gemini API  
+**Инфраструктура:** Supabase и Vercel настраиваются через MCP в Cursor
+
+---
+
+## 0. Дисклеймер и медицинский контур
+
+Приложение — **инструмент самоконтроля**, не замена врача или диетолога.
+
+**Перед стартом (онбординг, обязательный чекбокс):**
+- Нет противопоказаний к снижению веса без наблюдения врача (или есть разрешение врача).
+- Нет острых заболеваний ЖКТ, сердечно-сосудистых проблем без консультации.
+- Пользователь осознаёт, что цель −40 кг — длительный процесс (12–18 месяцев).
+
+**Красные флаги (баннер в UI, не LLM):**
+- Темп снижения > 1 кг/неделю более 3 недель подряд → предупреждение.
+- Калории ниже 1500 ккал/день → блокировка без явного подтверждения.
+- Симптомы «головокружение, слабость, боль в груди» → «обратитесь к врачу».
+
+**LLM никогда не:**
+- ставит диагнозы;
+- назначает лекарства;
+- пересчитывает калории/БЖУ (это делает код на бэкенде).
+
+---
+
+## 1. Общая идея проекта
+
+**Название (рабочее):** Denis120→80 / Denis Weight Journey
+
+**Цель:**  
+Персональное PWA для снижения веса Дениса с 120 кг до 80 кг, которое:
+- учитывает **ночной рабочий график** и нерегулярный сон;
+- ведёт учёт питания, калорий, белка, воды, веса, активности;
+- использует **Gemini API** для интерпретации данных и мотивации (не для расчётов);
+- даёт понятную визуализацию **трендов**, а не суточных скачков;
+- заточено на **одного пользователя** (без лишней сложности), с возможностью расширения позже.
+
+**Ключевая уникальность:**  
+«День» пользователя = **wake-to-wake** (от пробуждения до следующего пробуждения), а не календарные 00:00–24:00. Привязка приёмов пищи к блокам «сон / работа / свободное время».
+
+**Основные сценарии:**
+1. Онбординг: профиль, график, расчёт калорий и белка.
+2. Быстрое логирование еды (шаблоны, штрих-код, поиск Open Food Facts, ручной ввод).
+3. Дашборд «Мой день»: калории, белок, вода, вес-тренд, совет LLM.
+4. Настройка графика сна и смен.
+5. Прогресс: графики за неделю/месяц, вехи (110, 100, 90 кг).
+
+---
+
+## 2. Бизнес-правила расчётов (обязательно в коде, не в LLM)
+
+### 2.1. Базовый обмен (BMR)
+Формула **Mifflin-St Jeor** (мужчина):
+```
+BMR = 10 × вес(кг) + 6.25 × рост(см) − 5 × возраст − 5
+```
+
+### 2.2. TDEE
+```
+TDEE = BMR × коэффициент активности
+```
+| Уровень | Коэфф. | Описание |
+|---------|--------|----------|
+| Минимальный | 1.2 | Сидячая работа, мало движения |
+| Низкий | 1.375 | Лёгкая активность 1–3 раза/нед |
+| Средний | 1.55 | Умеренная 3–5 раз/нед |
+| Высокий | 1.725 | Активный 6–7 раз/нед |
+
+**Стартовое значение для Дениса:** 1.2–1.375 (ночные смены, сидячая работа).
+
+### 2.3. Целевые калории
+```
+целевые_калории = TDEE − дефицит
+```
+- **Стартовый дефицит:** 400 ккал (не 500–700 сразу).
+- **Минимум:** 1500 ккал/день (hard limit в UI).
+- **Пересмотр:** каждые 14 дней по среднему весу за 7 дней.
+  - Если средний вес не снижается 2 недели → дефицит +100 ккал (но не ниже 1500).
+  - Если снижение > 1 кг/нед 3 недели подряд → дефицит −100 ккал.
+
+### 2.4. Макросы (дневные цели)
+```
+белок (г)   = max(160, 1.8 × текущий_вес_кг)   // приоритет #1 в UI
+жиры (г)    = max(65, 0.8 × текущий_вес_кг)    // минимум для гормонов
+углеводы (г) = (целевые_калории − белок×4 − жиры×9) / 4
+```
+
+### 2.5. Вода
+- Цель: **2500 мл/день** (настраивается).
+- UI: кнопки +250 / +500 мл на дашборде.
+
+### 2.6. Вес и прогресс
+- Взвешивание: **ежедневно** (утром после туалета, до еды).
+- **Отображение:** скользящее среднее за 7 дней (основной показатель).
+- Суточный вес — вторично, мелким шрифтом.
+- Недельное изменение: `среднее_эта_неделя − среднее_прошлая_неделя`.
+
+### 2.7. Определение «дня»
+```
+день = интервал [время_пробуждения, время_следующего_пробуждения)
+```
+- Время пробуждения задаётся вручную или подтверждается утром («Проснулся в …»).
+- Все приёмы пищи, вода, активность привязаны к `user_day_id`, не к календарной дате.
+- Календарная дата хранится для экспорта, но аналитика — по user_day.
+
+### 2.8. ИМТ
+```
+ИМТ = вес / (рост_м)²
+```
+Информативно, не как единственная метрика.
+
+---
+
+## 3. Пользовательские сущности и данные
+
+### 3.1. Профиль (`profiles`)
+| Поле | Значение (Денис) | Тип |
+|------|------------------|-----|
+| display_name | Денис | text |
+| height_cm | 172 | int |
+| gender | male | enum |
+| birth_year | 1981 | int |
+| start_weight_kg | 120 | decimal |
+| target_weight_kg | 80 | decimal |
+| target_months | 15 | int (12–18) |
+| activity_level | sedentary | enum |
+| timezone | Europe/Moscow | text |
+| medical_ack_at | timestamp | обязательный чекбокс |
+| tdee_kcal | расчётный | int |
+| target_kcal | расчётный | int |
+| target_protein_g | расчётный | int |
+| target_fat_g | расчётный | int |
+| target_carbs_g | расчётный | int |
+| target_water_ml | 2500 | int |
+
+### 3.2. Типы дней и расписание (`day_templates`, `schedule_blocks`)
+**Типы дней:** `night_shift` | `recovery` | `day_off`
+
+Для каждого типа — блоки на шкале 0–24 ч:
+| Блок | Пример (night_shift) |
+|------|----------------------|
+| sleep | 08:00–12:00, 14:00–17:00 |
+| work | 22:00–06:00 |
+| free | остальное |
+| meal_windows | привязка к блокам (после сна, перед сменой, во смене, перед сном) |
+
+### 3.3. User Day (`user_days`)
+| Поле | Описание |
+|------|----------|
+| id | UUID |
+| profile_id | FK |
+| day_template_type | night_shift / recovery / day_off |
+| woke_at | timestamp начала «дня» |
+| closed_at | timestamp закрытия (след. пробуждение) |
+| sleep_quality | 1–5 (опционально) |
+| notes | текст |
+
+### 3.4. Питание (`meals`, `meal_items`)
+**meal:**
+- user_day_id, eaten_at, meal_type (breakfast/snack/main/dinner/other)
+
+**meal_item:**
+- name, grams, kcal, protein_g, fat_g, carbs_g
+- source: `barcode` | `open_food_facts` | `template` | `manual`
+- barcode (nullable), off_product_id (nullable)
+
+**Избранное / шаблоны (`food_templates`):**
+- «Творог с мёдом», «Протеиновый коктейль», «Стандартный перекус»
+- один тап → добавить в текущий приём пищи
+
+### 3.5. Вес (`weight_logs`)
+- user_day_id, measured_at, weight_kg
+- is_primary (утреннее взвешивание)
+
+### 3.6. Объёмы (`body_measurements`) — фаза 2
+MVP: только **талия** (раз в неделю). Грудь/бедро — позже.
+
+### 3.7. Вода (`water_logs`)
+- user_day_id, logged_at, amount_ml
+
+### 3.8. Активность (`activity_logs`)
+- user_day_id, type: `steps` | `walk` | `stretch` | `strength`
+- value (шаги) или duration_min
+- MVP: шаги (ручной ввод) + флажок «была силовая тренировка»
+
+### 3.9. Теги дня (`day_tags`) — фаза 2
+`stress` | `poor_sleep` | `alcohol` | `fast_food` | `late_snack`
+
+### 3.10. LLM-советы (`ai_insights`)
+- user_day_id, type: `daily_tip` | `menu_suggestion` | `warning`
+- content_json (структурированный ответ)
+- prompt_version, created_at
+
+---
+
+## 4. Экраны и функции (UI)
+
+### 4.1. Онбординг (один раз)
+1. Медицинский чекбокс.
+2. Рост, вес, цель, возраст.
+3. Тип работы: ночные смены.
+4. Три шаблона дня (ночь / отсыпной / выходной) — упрощённая форма.
+5. Авторасчёт: TDEE, калории, белок, жиры, углеводы, срок (~X месяцев при −0.5 кг/нед).
+6. Экран «Итого»: «Сейчас 120 кг → цель 80 кг за ~15 мес. Сегодня: N ккал, белок M г.»
+
+### 4.2. Дашборд «Мой день» (главный экран)
+**Mobile-first, desktop — та же вёрстка, шире.**
+
+Блоки сверху вниз:
+1. **Прогресс веса:** 7-day average, мини-график, «−X кг от старта».
+2. **Калории:** кольцо/бар — съедено / цель / осталось.
+3. **Белок:** отдельный бар (приоритет!), «120 / 160 г».
+4. **Вода:** прогресс + кнопки +250 / +500.
+5. **Приёмы пищи** по meal_windows текущего типа дня.
+6. **Совет дня (LLM):** 1 карточка, кнопка «Обновить» (лимит 1 раз/день автоматически).
+7. **Быстрые действия:** + еда, + вода, + вес, «Проснулся».
+
+**Тёмная тема по умолчанию** (ночные смены). Светлая — в настройках.
+
+### 4.3. Экран «Питание»
+- Поиск (Open Food Facts API + локальные шаблоны).
+- Сканер штрих-кода (PWA, `getUserMedia`, mobile).
+- Шаблоны одним тапом.
+- Ручной ввод (название, граммы, ккал, БЖУ).
+- Сводка дня: калории, БЖУ, % белка.
+
+**Не в MVP:** сложные рецепты из нескольких ингредиентов (фаза 2).
+
+### 4.4. Экран «График и сон»
+- Визуальная шкала 0–24 ч с блоками sleep/work/free.
+- Редактирование трёх типов дней.
+- Привязка meal_windows к блокам.
+- Кнопка «Сегодняшний тип дня».
+
+### 4.5. Экран «Прогресс»
+- График веса (7-day average) — неделя / месяц / всё время.
+- График калорий (цель vs факт, по user_day).
+- График белка.
+- Вехи: 115, 110, 105, 100, 95, 90, 85, 80 кг.
+- Предупреждения (код, не LLM): слишком быстро / плато 3 недели.
+
+### 4.6. Настройки
+- Цели и дефицит (с предупреждением при < 1500 ккал).
+- Шаблоны еды.
+- Тема (тёмная/светлая).
+- Экспорт JSON/CSV.
+- PIN-код входа (4–6 цифр).
+
+**Не в MVP:** полноценный FAQ-чат. Фаза 2: кнопка «Задать вопрос» с лимитом 3/день.
+
+---
+
+## 5. LLM (Gemini API) — роль и ограничения
+
+### 5.1. Что делает LLM
+1. **Совет дня** — анализ вчерашнего user_day: калории, белок, время еды, вода, сон.
+2. **Меню на завтра** — 3–4 приёма с учётом графика и шаблонов (творог, протеин).
+3. **Мягкая мотивация** — тон поддержки, без стыда.
+
+### 5.2. Что LLM НЕ делает
+- Не считает BMR/TDEE/калории.
+- Не меняет целевые макросы.
+- Не даёт медицинских назначений.
+
+### 5.3. Технический поток
+```
+1. Server Action / API Route собирает JSON-контекст за 3–7 дней
+2. Подставляет в prompt template (версия в коде, например v1)
+3. Gemini → structured JSON:
+   {
+     "tip": "string",
+     "action": "string",
+     "focus": "protein|water|timing|activity",
+     "risk_level": "none|low|medium"
+   }
+4. Валидация Zod на сервере
+5. Сохранение в ai_insights
+6. risk_level >= medium → дублировать стандартным UI-предупреждением
+```
+
+### 5.4. Лимиты
+- Автосовет: 1 раз в сутки (cron или при первом открытии дашборда).
+- Ручное обновление: max 2 раза в сутки.
+- Меню на завтра: max 1 запрос в сутки.
+- Кэш ответа в БД, не дергать API повторно.
+
+### 5.5. Переменные окружения
+```
+GEMINI_API_KEY=         # только server-side, не NEXT_PUBLIC_
+```
+
+---
+
+## 6. Техническая архитектура
+
+### 6.1. Стек (фиксированный)
+| Слой | Технология |
+|------|------------|
+| Framework | **Next.js 15** (App Router) + **TypeScript** |
+| Styling | **Tailwind CSS** + shadcn/ui |
+| Charts | **Recharts** |
+| DB + Auth | **Supabase** (PostgreSQL, Auth, RLS) |
+| ORM | **Supabase JS** + typed queries (или Prisma поверх Postgres — по решению разработчика, предпочтительно supabase-js) |
+| Hosting | **Vercel** |
+| Domain | **tuttech.net** → Vercel DNS |
+| LLM | **Google Gemini API** |
+| Products | **Open Food Facts API** |
+| PWA | **next-pwa** или `@serwist/next` |
+| Validation | **Zod** |
+| Dates | **date-fns** + **date-fns-tz** (Europe/Moscow) |
+
+### 6.2. Деплой и домен
+```
+Production:  https://denis.tuttech.net  (или tuttech.net/denis)
+Preview:     Vercel preview deployments
+```
+
+**Vercel (через MCP):**
+- Подключить репозиторий.
+- Env vars: `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `GEMINI_API_KEY`.
+- Custom domain: `denis.tuttech.net` → CNAME на Vercel.
+
+**MCP-серверы проекта** (файл `.cursor/mcp.json`, инструкция `docs/MCP-SETUP.md`):
+
+| Сервер | URL | Задачи |
+|--------|-----|--------|
+| Supabase | `https://mcp.supabase.com/mcp?project_ref=...` | Проект, миграции, SQL, ключи, advisors |
+| Vercel | `https://mcp.vercel.com` | Деплой, env vars, домены, логи сборок |
+| Cloudflare | `https://mcp.cloudflare.com/mcp` | DNS зоны `tuttech.net`, SSL |
+
+После создания `.cursor/mcp.json` — Reload Window в Cursor, OAuth для каждого сервера.
+
+**Supabase (через MCP):**
+- Создать проект `denis120-80` (или использовать существующий).
+- Записать `SUPABASE_PROJECT_REF` в `.env`.
+- Миграции через `apply_migration`.
+- RLS на всех таблицах.
+- Auth: email+password или magic link (один пользователь — один аккаунт).
+
+**Vercel (через MCP):**
+- Подключить репозиторий, env vars, custom domain `denis.tuttech.net`.
+
+**Cloudflare (через MCP):**
+- CNAME `denis` → `cname.vercel-dns.com` (DNS only, без прокси).
+
+### 6.3. Архитектура приложения
+```
+┌─────────────────────────────────────────────────────┐
+│  PWA Client (Next.js)                               │
+│  - Dashboard, Food, Schedule, Progress, Settings    │
+│  - Service Worker (offline queue для meal/water)    │
+└──────────────────┬──────────────────────────────────┘
+                   │
+┌──────────────────▼──────────────────────────────────┐
+│  Next.js Server (Server Actions + Route Handlers)   │
+│  - Расчёты BMR/TDEE/макросов                        │
+│  - Gemini proxy (не отдавать ключ клиенту)          │
+│  - Open Food Facts proxy (кэш в Supabase)           │
+└──────────────────┬──────────────────────────────────┘
+                   │
+┌──────────────────▼──────────────────────────────────┐
+│  Supabase                                           │
+│  - PostgreSQL (данные)                              │
+│  - Auth (сессии)                                    │
+│  - RLS (profile_id = auth.uid())                    │
+│  - Edge Function (опционально): cron daily insight  │
+└─────────────────────────────────────────────────────┘
+```
+
+### 6.4. Авторизация (single-user, но безопасно)
+- Один аккаунт Дениса в Supabase Auth.
+- RLS: `auth.uid() = profile_id` на всех таблицах.
+- Дополнительно: PIN в localStorage для быстрого входа на устройстве (UX, не security boundary).
+- `service_role` key — **только** в server-side, никогда в клиенте.
+
+### 6.5. Offline / PWA
+- Installable PWA (manifest, icons).
+- Очередь offline: meal_items, water_logs → sync при появлении сети.
+- Критичные расчёты — на сервере после sync.
+
+### 6.6. Open Food Facts
+- Поиск: `https://world.openfoodfacts.org/cgi/search.pl?search_terms=...&json=1`
+- Штрих-код: `https://world.openfoodfacts.org/api/v2/product/{barcode}.json`
+- Кэш популярных продуктов в таблице `off_cache` (barcode, json, fetched_at).
+
+---
+
+## 7. Схема БД (Supabase / PostgreSQL)
+
+```sql
+-- profiles (1:1 с auth.users)
+create table profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  display_name text not null,
+  height_cm int not null,
+  gender text not null check (gender in ('male', 'female')),
+  birth_year int not null,
+  start_weight_kg numeric(5,2) not null,
+  target_weight_kg numeric(5,2) not null,
+  target_months int not null default 15,
+  activity_level text not null,
+  timezone text not null default 'Europe/Moscow',
+  medical_ack_at timestamptz not null,
+  tdee_kcal int,
+  target_kcal int,
+  target_protein_g int,
+  target_fat_g int,
+  target_carbs_g int,
+  target_water_ml int not null default 2500,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+-- day_templates (3 шаблона на профиль)
+create table day_templates (
+  id uuid primary key default gen_random_uuid(),
+  profile_id uuid not null references profiles(id) on delete cascade,
+  template_type text not null check (template_type in ('night_shift', 'recovery', 'day_off')),
+  schedule_json jsonb not null, -- {sleep: [], work: [], free: [], meal_windows: []}
+  unique (profile_id, template_type)
+);
+
+-- user_days
+create table user_days (
+  id uuid primary key default gen_random_uuid(),
+  profile_id uuid not null references profiles(id) on delete cascade,
+  day_template_type text not null,
+  woke_at timestamptz not null,
+  closed_at timestamptz,
+  sleep_quality smallint check (sleep_quality between 1 and 5),
+  notes text,
+  created_at timestamptz default now()
+);
+
+-- meals
+create table meals (
+  id uuid primary key default gen_random_uuid(),
+  user_day_id uuid not null references user_days(id) on delete cascade,
+  eaten_at timestamptz not null,
+  meal_type text not null,
+  created_at timestamptz default now()
+);
+
+-- meal_items
+create table meal_items (
+  id uuid primary key default gen_random_uuid(),
+  meal_id uuid not null references meals(id) on delete cascade,
+  name text not null,
+  grams numeric(7,2),
+  kcal numeric(7,2) not null,
+  protein_g numeric(6,2) default 0,
+  fat_g numeric(6,2) default 0,
+  carbs_g numeric(6,2) default 0,
+  source text not null,
+  barcode text,
+  off_product_id text,
+  created_at timestamptz default now()
+);
+
+-- food_templates
+create table food_templates (
+  id uuid primary key default gen_random_uuid(),
+  profile_id uuid not null references profiles(id) on delete cascade,
+  name text not null,
+  default_grams numeric(7,2),
+  kcal numeric(7,2) not null,
+  protein_g numeric(6,2) default 0,
+  fat_g numeric(6,2) default 0,
+  carbs_g numeric(6,2) default 0,
+  sort_order int default 0
+);
+
+-- weight_logs
+create table weight_logs (
+  id uuid primary key default gen_random_uuid(),
+  profile_id uuid not null references profiles(id) on delete cascade,
+  user_day_id uuid references user_days(id),
+  measured_at timestamptz not null,
+  weight_kg numeric(5,2) not null,
+  is_primary boolean default false
+);
+
+-- water_logs
+create table water_logs (
+  id uuid primary key default gen_random_uuid(),
+  user_day_id uuid not null references user_days(id) on delete cascade,
+  logged_at timestamptz not null,
+  amount_ml int not null
+);
+
+-- activity_logs
+create table activity_logs (
+  id uuid primary key default gen_random_uuid(),
+  user_day_id uuid not null references user_days(id) on delete cascade,
+  activity_type text not null,
+  value int,           -- шаги
+  duration_min int,
+  logged_at timestamptz not null
+);
+
+-- ai_insights
+create table ai_insights (
+  id uuid primary key default gen_random_uuid(),
+  profile_id uuid not null references profiles(id) on delete cascade,
+  user_day_id uuid references user_days(id),
+  insight_type text not null,
+  content_json jsonb not null,
+  prompt_version text not null,
+  created_at timestamptz default now()
+);
+
+-- off_cache
+create table off_cache (
+  barcode text primary key,
+  product_json jsonb not null,
+  fetched_at timestamptz default now()
+);
+
+-- RLS: enable on all tables, policy auth.uid() = profile_id (или через join для child tables)
+```
+
+---
+
+## 8. API / Server Actions (основные)
+
+| Метод | Endpoint / Action | Описание |
+|-------|-------------------|----------|
+| POST | `completeOnboarding` | Профиль + day_templates + первый user_day |
+| GET | `getDashboard` | Сводка текущего user_day |
+| POST | `startDay` | «Проснулся» → новый user_day |
+| POST | `closeDay` | Закрыть текущий день |
+| POST | `addMealItem` | Добавить еду (из шаблона/OFF/ручной) |
+| POST | `addWater` | +250/+500 мл |
+| POST | `logWeight` | Записать вес |
+| POST | `logActivity` | Шаги / тренировка |
+| GET | `getProgress` | Графики за период |
+| POST | `generateDailyInsight` | Gemini → ai_insights |
+| POST | `generateMenu` | Меню на следующий день |
+| GET | `searchFood` | OFF + templates |
+| GET | `getProductByBarcode` | OFF + cache |
+| GET | `exportData` | JSON/CSV |
+
+---
+
+## 9. Нефункциональные требования
+
+| Требование | Значение |
+|------------|----------|
+| Загрузка дашборда | < 2 сек (LCP) |
+| Ввод еды из шаблона | < 10 сек, 2 тапа |
+| Ввод еды штрих-код | < 30 сек |
+| Mobile usable | 375px ширина |
+| Accessibility | контраст WCAG AA, крупные tap-targets ≥ 44px |
+| i18n | Русский UI |
+| Timezone | Europe/Moscow, явно в коде |
+| Backup | Supabase daily backup (встроенный) + экспорт JSON раз в месяц |
+| Безопасность | RLS, HTTPS, secrets только server-side |
+
+---
+
+## 10. MVP — scope и критерии готовности
+
+### 10.1. В MVP (фаза 1)
+- [x] Онбординг с медицинским чекбоксом и расчётом калорий/белка
+- [x] Wake-to-wake user_day
+- [x] 3 шаблона дня (ночь / отсыпной / выходной)
+- [x] Дашборд: калории, **белок**, вода, вес (7-day avg)
+- [x] Логирование еды: шаблоны + ручной + Open Food Facts + штрих-код (PWA)
+- [x] Логирование веса и воды
+- [x] Активность: шаги + флажок силовой
+- [x] Экран прогресса: вес, калории, белок (неделя/месяц)
+- [x] Gemini: 1 совет дня + меню на завтра
+- [x] Auth (Supabase) + RLS
+- [x] PWA installable
+- [x] Тёмная тема по умолчанию
+- [x] Деплой на Vercel, домен tuttech.net
+- [x] Предупреждения по темпу (код, не LLM)
+
+### 10.2. Фаза 2 (после 4–6 недель использования)
+- Теги дня (алкоголь, стресс, фастфуд)
+- Объёмы тела (талия + грудь/бедро)
+- FAQ-чат с LLM (лимит 3/день)
+- Меню на неделю
+- Сложные рецепты
+- Экспорт PDF для врача
+- Интеграция Google Fit / Apple Health
+- Push-уведомления (Web Push)
+- Пересмотр дефицита по расписанию (cron)
+
+### 10.3. MVP готов, когда
+1. Денис прошёл онбординг, видит персональные калории и белок.
+2. За 1 день можно залогировать все приёмы пищи (< 5 мин суммарно через шаблоны).
+3. Вес отображается как 7-day average с графиком.
+4. Совет LLM появляется на дашборде и учитывает график сна.
+5. Приложение открывается с телефона как PWA, штрих-код сканируется.
+6. Данные сохраняются в Supabase, доступны после перелогина.
+7. Работает на `denis.tuttech.net` по HTTPS.
+
+---
+
+## 11. Структура репозитория (рекомендация)
+
+```
+denis120-80/
+├── app/
+│   ├── (auth)/login/
+│   ├── (app)/
+│   │   ├── dashboard/
+│   │   ├── food/
+│   │   ├── schedule/
+│   │   ├── progress/
+│   │   └── settings/
+│   ├── api/
+│   │   ├── ai/insight/
+│   │   ├── ai/menu/
+│   │   └── food/search/
+│   └── onboarding/
+├── components/
+├── lib/
+│   ├── supabase/         # client, server, middleware
+│   ├── calculations/     # BMR, TDEE, macros, 7-day avg
+│   ├── gemini/             # prompts, schemas
+│   └── openfoodfacts/
+├── supabase/
+│   └── migrations/
+├── public/
+│   ├── manifest.json
+│   └── icons/
+├── .env.local.example
+└── README.md
+```
+
+---
+
+## 12. Переменные окружения
+
+```env
+# Supabase (public)
+NEXT_PUBLIC_SUPABASE_URL=https://xxx.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJ...
+
+# Supabase (server only — если нужен admin)
+SUPABASE_SERVICE_ROLE_KEY=eyJ...
+
+# Gemini (server only)
+GEMINI_API_KEY=...
+
+# App
+NEXT_PUBLIC_APP_URL=https://denis.tuttech.net
+```
+
+---
+
+## 13. Порядок разработки (для Cursor)
+
+1. **Инициализация:** Next.js + Tailwind + shadcn + Supabase client.
+2. **Supabase MCP:** создать проект, применить миграции, включить RLS.
+3. **Auth:** login, middleware, защита роутов.
+4. **lib/calculations:** BMR, TDEE, macros, 7-day average — с unit-тестами.
+5. **Онбординг:** форма + day_templates + первый user_day.
+6. **Дашборд:** калории, белок, вода, вес.
+7. **Food:** templates, manual, Open Food Facts.
+8. **PWA:** manifest, service worker, barcode scanner.
+9. **Schedule:** редактор шаблонов дня.
+10. **Progress:** Recharts графики.
+11. **Gemini:** daily insight + menu suggestion.
+12. **Vercel MCP:** деплой, env vars, домен tuttech.net.
+13. **Полировка:** тёмная тема, offline queue, экспорт JSON.
+
+---
+
+## 14. Референсы (для ориентира, не копировать)
+
+- MyFitnessPal — UX логирования еды, штрих-коды.
+- LoseIt — простота дефицита.
+- Cronometer — точность макросов.
+- Open Food Facts — база продуктов (использовать напрямую).
+
+---
+
+*Документ готов для передачи разработчику в Cursor. Следующий шаг: инициализация репозитория и создание Supabase-проекта через MCP.*

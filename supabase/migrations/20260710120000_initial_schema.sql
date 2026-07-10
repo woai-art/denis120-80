@@ -1,0 +1,1 @@
+-- Denis120→80 initial schema (applied via Supabase MCP)
