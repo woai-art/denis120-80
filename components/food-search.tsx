@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, useTransition } from "react";
 import { addOffFood } from "@/lib/actions";
 import { BarcodeScanner } from "@/components/barcode-scanner";
+import { BarcodeSaveForm } from "@/components/barcode-save-form";
 
 type Product = {
   id: string;
@@ -24,6 +25,7 @@ export function FoodSearch() {
     "idle" | "searching" | "empty" | "error" | "added"
   >("idle");
   const [scannerOpen, setScannerOpen] = useState(false);
+  const [missingBarcode, setMissingBarcode] = useState<string | null>(null);
   const [isPending, startTransition] = useTransition();
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -58,10 +60,12 @@ export function FoodSearch() {
 
   async function handleBarcode(code: string) {
     setScannerOpen(false);
+    setMissingBarcode(null);
     setStatus("searching");
     try {
       const response = await fetch(`/api/food/barcode/${code}`);
       if (!response.ok) {
+        setMissingBarcode(code);
         setStatus("empty");
         return;
       }
@@ -116,11 +120,20 @@ export function FoodSearch() {
       {status === "searching" && (
         <p className="text-sm text-zinc-500">Ищем...</p>
       )}
-      {status === "empty" && (
+      {status === "empty" && !missingBarcode && (
         <p className="text-sm text-zinc-500">
           Ничего не нашлось. Попробуй другое название или ручной ввод ниже.
         </p>
       )}
+      {missingBarcode ? (
+        <BarcodeSaveForm
+          barcode={missingBarcode}
+          onSaved={() => {
+            setMissingBarcode(null);
+            setStatus("added");
+          }}
+        />
+      ) : null}
       {status === "error" && (
         <p className="text-sm text-red-300">
           Open Food Facts не отвечает. Попробуй позже или ручной ввод.

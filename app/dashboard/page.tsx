@@ -1,14 +1,15 @@
 import { AppNav } from "@/components/app-nav";
+import { FoodLogList } from "@/components/food-log-list";
 import { ProgressBar } from "@/components/progress-bar";
+import { StartDayForm } from "@/components/start-day-form";
 import {
   addWater250,
   addWater500,
   logWeight,
   requestDailyInsight,
   requestMenuSuggestion,
-  startDay,
 } from "@/lib/actions";
-import { getDashboardSummary, getMenuSuggestion } from "@/lib/data";
+import { getDashboardSummary, getMenuSuggestion, getTodayFoodLog } from "@/lib/data";
 import type { MenuSuggestion } from "@/lib/gemini";
 import { formatNumber } from "@/lib/utils";
 
@@ -25,6 +26,8 @@ export default async function DashboardPage() {
   const menu = userDay
     ? ((await getMenuSuggestion(profile.id, userDay.id)) as MenuSuggestion | null)
     : null;
+
+  const foodLog = await getTodayFoodLog(profile.id);
 
   return (
     <div className="mx-auto flex min-h-dvh max-w-3xl flex-col">
@@ -83,21 +86,42 @@ export default async function DashboardPage() {
           </div>
         </section>
 
+        <section className="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-4">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <h2 className="text-lg font-medium">Дневник питания</h2>
+            <a href="/food" className="btn-interactive text-sm text-emerald-400 hover:text-emerald-300">
+              + Добавить
+            </a>
+          </div>
+          {!userDay ? (
+            <p className="text-sm text-zinc-500">
+              Нажми «Проснулся», чтобы начать день. Еда из раздела «Питание»
+              попадёт сюда и в счётчики калорий выше.
+            </p>
+          ) : foodLog.length === 0 ? (
+            <p className="text-sm text-zinc-500">
+              Пока ничего не записано. Перейди в «Питание» и добавь приёмы
+              пищи — они появятся здесь.
+            </p>
+          ) : (
+            <FoodLogList entries={foodLog} showTime />
+          )}
+        </section>
+
+        <StartDayForm
+          hasOpenDay={Boolean(userDay)}
+          currentType={userDay?.day_template_type}
+        />
+
         <section className="flex flex-wrap gap-3">
           <form action={addWater250}>
-            <button className="min-h-11 rounded-xl bg-sky-500/15 px-4 py-2 text-sky-300">
+            <button className="btn-interactive min-h-11 rounded-xl bg-sky-500/15 px-4 py-2 text-sky-300 hover:bg-sky-500/25 active:scale-[0.98]">
               +250 мл
             </button>
           </form>
           <form action={addWater500}>
-            <button className="min-h-11 rounded-xl bg-sky-500/15 px-4 py-2 text-sky-300">
+            <button className="btn-interactive min-h-11 rounded-xl bg-sky-500/15 px-4 py-2 text-sky-300 hover:bg-sky-500/25 active:scale-[0.98]">
               +500 мл
-            </button>
-          </form>
-          <form action={startDay}>
-            <input type="hidden" name="dayTemplateType" value="night_shift" />
-            <button className="min-h-11 rounded-xl border border-zinc-700 px-4 py-2">
-              Проснулся
             </button>
           </form>
         </section>
@@ -113,7 +137,7 @@ export default async function DashboardPage() {
               required
               className="min-h-11 flex-1 rounded-xl border border-zinc-700 bg-zinc-950 px-4"
             />
-            <button className="min-h-11 rounded-xl bg-emerald-500 px-4 font-medium text-zinc-950">
+            <button className="btn-interactive min-h-11 rounded-xl bg-emerald-500 px-4 font-medium text-zinc-950 hover:bg-emerald-400 active:scale-[0.98]">
               Сохранить
             </button>
           </form>
@@ -124,7 +148,7 @@ export default async function DashboardPage() {
             <h2 className="text-lg font-medium">Совет дня</h2>
             {userDay ? (
               <form action={requestDailyInsight}>
-                <button className="min-h-9 rounded-lg border border-zinc-700 px-3 text-sm text-zinc-300">
+                <button className="btn-interactive min-h-9 rounded-lg border border-zinc-700 px-3 text-sm text-zinc-300 hover:border-zinc-500 hover:bg-zinc-800">
                   {insight ? "Обновить" : "Получить совет"}
                 </button>
               </form>
@@ -148,7 +172,7 @@ export default async function DashboardPage() {
             <h2 className="text-lg font-medium">Меню на день</h2>
             {userDay && !menu ? (
               <form action={requestMenuSuggestion}>
-                <button className="min-h-9 rounded-lg border border-zinc-700 px-3 text-sm text-zinc-300">
+                <button className="btn-interactive min-h-9 rounded-lg border border-zinc-700 px-3 text-sm text-zinc-300 hover:border-zinc-500 hover:bg-zinc-800">
                   Сгенерировать
                 </button>
               </form>

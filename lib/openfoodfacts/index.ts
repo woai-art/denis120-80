@@ -1,4 +1,5 @@
 import { createClient } from "@/lib/supabase/server";
+import { kjToKcalPer100g } from "@/lib/nutrition";
 
 export type OffProduct = {
   id: string;
@@ -9,10 +10,16 @@ export type OffProduct = {
   proteinPer100g: number;
   fatPer100g: number;
   carbsPer100g: number;
+  source: "open_food_facts" | "user_barcode" | "user_saved";
 };
 
+const OFF_INSTANCES = [
+  "https://world.openfoodfacts.org",
+  "https://ru.openfoodfacts.org",
+  "https://by.openfoodfacts.org",
+] as const;
+
 const OFF_SEARCH_URL = "https://world.openfoodfacts.org/cgi/search.pl";
-const OFF_PRODUCT_URL = "https://world.openfoodfacts.org/api/v2/product";
 const CACHE_TTL_DAYS = 30;
 
 type OffRawProduct = {
@@ -23,16 +30,31 @@ type OffRawProduct = {
   brands?: string;
   nutriments?: {
     "energy-kcal_100g"?: number;
+    "energy-kj_100g"?: number;
     proteins_100g?: number;
     fat_100g?: number;
     carbohydrates_100g?: number;
   };
 };
 
-function mapProduct(raw: OffRawProduct): OffProduct | null {
+function extractKcalPer100g(nutriments: OffRawProduct["nutriments"]): number | null {
+  if (!nutriments) return null;
+  if (nutriments["energy-kcal_100g"] != null) {
+    return Math.round(nutriments["energy-kcal_100g"]);
+  }
+  if (nutriments["energy-kj_100g"] != null) {
+    return kjToKcalPer100g(nutriments["energy-kj_100g"]);
+  }
+  return null;
+}
+
+function mapProduct(
+  raw: OffRawProduct,
+  source: OffProduct["source"] = "open_food_facts",
+): OffProduct | null {
   const name = raw.product_name_ru || raw.product_name;
-  const nutriments = raw.nutriments;
-  if (!name || !nutriments || nutriments["energy-kcal_100g"] == null) {
+  const kcalPer100g = extractKcalPer100g(raw.nutriments);
+  if (!name || kcalPer100g == null) {
     return null;
   }
 
@@ -41,11 +63,35 @@ function mapProduct(raw: OffRawProduct): OffProduct | null {
     barcode: raw.code ?? null,
     name,
     brand: raw.brands?.split(",")[0]?.trim() || null,
-    kcalPer100g: Math.round(nutriments["energy-kcal_100g"]),
-    proteinPer100g: Number((nutriments.proteins_100g ?? 0).toFixed(1)),
-    fatPer100g: Number((nutriments.fat_100g ?? 0).toFixed(1)),
-    carbsPer100g: Number((nutriments.carbohydrates_100g ?? 0).toFixed(1)),
+    kcalPer100g,
+    proteinPer100g: Number((raw.nutriments?.proteins_100g ?? 0).toFixed(1)),
+    fatPer100g: Number((raw.nutriments?.fat_100g ?? 0).toFixed(1)),
+    carbsPer100g: Number((raw.nutriments?.carbohydrates_100g ?? 0).toFixed(1)),
+    source,
   };
+}
+
+async function fetchOffBarcode(
+  baseUrl: string,
+  barcode: string,
+): Promise<OffProduct | null> {
+  const response = await fetch(
+    `${baseUrl}/api/v2/product/${encodeURIComponent(barcode)}.json?fields=code,product_name,product_name_ru,brands,nutriments`,
+    {
+      headers: { "User-Agent": "Denis120-80/1.0 (personal weight tracker)" },
+      next: { revalidate: 86400 },
+    },
+  );
+
+  if (!response.ok) return null;
+
+  const data = (await response.json()) as {
+    status?: number;
+    product?: OffRawProduct;
+  };
+
+  if (data.status !== 1 || !data.product) return null;
+  return mapProduct(data.product);
 }
 
 export async function searchProducts(query: string): Promise<OffProduct[]> {
@@ -55,6 +101,7 @@ export async function searchProducts(query: string): Promise<OffProduct[]> {
     action: "process",
     json: "1",
     page_size: "10",
+    countries_tags_en: "belarus,russia",
     fields: "code,product_name,product_name_ru,brands,nutriments",
   });
 
@@ -67,13 +114,46 @@ export async function searchProducts(query: string): Promise<OffProduct[]> {
 
   const data = (await response.json()) as { products?: OffRawProduct[] };
   return (data.products ?? [])
-    .map(mapProduct)
+    .map((p) => mapProduct(p))
     .filter((product): product is OffProduct => product !== null);
+}
+
+export async function getUserBarcodeProduct(
+  profileId: string,
+  barcode: string,
+): Promise<OffProduct | null> {
+  const supabase = await createClient();
+  const { data } = await supabase
+    .from("user_barcode_products")
+    .select("*")
+    .eq("profile_id", profileId)
+    .eq("barcode", barcode)
+    .maybeSingle();
+
+  if (!data) return null;
+
+  return {
+    id: data.id,
+    barcode: data.barcode,
+    name: data.name,
+    brand: null,
+    kcalPer100g: Number(data.kcal_per_100g),
+    proteinPer100g: Number(data.protein_per_100g),
+    fatPer100g: Number(data.fat_per_100g),
+    carbsPer100g: Number(data.carbs_per_100g),
+    source: "user_barcode",
+  };
 }
 
 export async function getProductByBarcode(
   barcode: string,
+  profileId?: string,
 ): Promise<OffProduct | null> {
+  if (profileId) {
+    const userProduct = await getUserBarcodeProduct(profileId, barcode);
+    if (userProduct) return userProduct;
+  }
+
   const supabase = await createClient();
 
   const { data: cached } = await supabase
@@ -89,30 +169,17 @@ export async function getProductByBarcode(
     }
   }
 
-  const response = await fetch(
-    `${OFF_PRODUCT_URL}/${encodeURIComponent(barcode)}.json?fields=code,product_name,product_name_ru,brands,nutriments`,
-    {
-      headers: { "User-Agent": "Denis120-80/1.0 (personal weight tracker)" },
-    },
-  );
+  for (const baseUrl of OFF_INSTANCES) {
+    const product = await fetchOffBarcode(baseUrl, barcode);
+    if (product) {
+      await supabase.from("off_cache").upsert({
+        barcode,
+        product_json: product,
+        fetched_at: new Date().toISOString(),
+      });
+      return product;
+    }
+  }
 
-  if (!response.ok) return null;
-
-  const data = (await response.json()) as {
-    status?: number;
-    product?: OffRawProduct;
-  };
-
-  if (data.status !== 1 || !data.product) return null;
-
-  const product = mapProduct(data.product);
-  if (!product) return null;
-
-  await supabase.from("off_cache").upsert({
-    barcode,
-    product_json: product,
-    fetched_at: new Date().toISOString(),
-  });
-
-  return product;
+  return null;
 }

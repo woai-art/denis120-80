@@ -21,7 +21,7 @@ export async function GET(
     return NextResponse.json({ error: "invalid_barcode" }, { status: 400 });
   }
 
-  const product = await getProductByBarcode(code);
+  const product = await getProductByBarcode(code, user.id);
 
   if (!product) {
     return NextResponse.json({ error: "not_found" }, { status: 404 });

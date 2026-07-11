@@ -26,7 +26,19 @@ npm run dev
 - `npm run test` — unit-тесты расчётов
 - `npm run lint` — ESLint
 
-## Песочница и деплой
+## Локальная песочница (основной способ разработки)
+
+```bash
+cp .env.example .env.local   # один раз, заполни ключи из Supabase
+npm install
+npm run dev
+```
+
+Открой **http://localhost:3000** — изменения в коде видны сразу (hot reload). Деплой на Vercel нужен только когда хочешь показать кому-то снаружи или выкатить в production.
+
+Подробнее о фичах и планах: [docs/ROADMAP.md](docs/ROADMAP.md).
+
+## Песочница и деплой (Vercel)
 
 | Ветка | Куда деплоится | URL |
 |-------|----------------|-----|

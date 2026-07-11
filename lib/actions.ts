@@ -16,6 +16,10 @@ import {
   PROMPT_VERSION,
 } from "@/lib/gemini";
 import { getAppUrl } from "@/lib/app-url";
+import { mapDbError, type ActionState } from "@/lib/action-result";
+import { DAY_TYPE_META } from "@/lib/calendar";
+import { COMMON_FOODS } from "@/lib/common-foods";
+import { scaleNutrition } from "@/lib/nutrition";
 import {
   DEFAULT_FOOD_TEMPLATES,
   DEFAULT_SCHEDULES,
@@ -36,6 +40,16 @@ type AuthState = {
   error?: string;
   success?: string;
 };
+
+export type StartDayState = ActionState;
+export type SchedulePlanState = ActionState;
+
+const PLAN_CYCLE: (DayTemplateType | null)[] = [
+  null,
+  "night_shift",
+  "recovery",
+  "day_off",
+];
 
 function mapAuthError(message: string) {
   if (message.includes("Email not confirmed")) {
@@ -206,7 +220,10 @@ export async function completeOnboarding(formData: FormData) {
   redirect("/dashboard");
 }
 
-export async function startDay(formData: FormData) {
+export async function startDay(
+  _prevState: StartDayState,
+  formData: FormData,
+): Promise<StartDayState> {
   const templateType = String(
     formData.get("dayTemplateType") ?? "night_shift",
   ) as DayTemplateType;
@@ -214,7 +231,9 @@ export async function startDay(formData: FormData) {
   const {
     data: { user },
   } = await supabase.auth.getUser();
-  if (!user) return;
+  if (!user) {
+    return { error: "Нужно войти в аккаунт." };
+  }
 
   const openDay = await supabase
     .from("user_days")
@@ -223,20 +242,35 @@ export async function startDay(formData: FormData) {
     .is("closed_at", null)
     .maybeSingle();
 
+  if (openDay.error) {
+    return { error: mapDbError(openDay.error.message) };
+  }
+
   if (openDay.data?.id) {
-    await supabase
+    const { error: closeError } = await supabase
       .from("user_days")
       .update({ closed_at: new Date().toISOString() })
       .eq("id", openDay.data.id);
+    if (closeError) {
+      return { error: mapDbError(closeError.message) };
+    }
   }
 
-  await supabase.from("user_days").insert({
+  const { error } = await supabase.from("user_days").insert({
     profile_id: user.id,
     day_template_type: templateType,
     woke_at: new Date().toISOString(),
   });
 
+  if (error) {
+    return { error: mapDbError(error.message) };
+  }
+
   revalidatePath("/dashboard");
+  revalidatePath("/schedule");
+  return {
+    success: `День начат (${DAY_TYPE_META[templateType].label}). Можно записывать еду.`,
+  };
 }
 
 export async function addWater(amountMl: number) {
@@ -350,7 +384,111 @@ export async function addFoodTemplate(formData: FormData) {
   revalidatePath("/food");
 }
 
-export async function addManualFood(formData: FormData) {
+export async function deleteMealItem(
+  _prevState: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const itemId = String(formData.get("itemId") ?? "");
+  if (!itemId) {
+    return { error: "Запись не найдена." };
+  }
+
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) {
+    return { error: "Нужно войти в аккаунт." };
+  }
+
+  const { data: row, error: readError } = await supabase
+    .from("meal_items")
+    .select(
+      `
+      id,
+      meal_id,
+      name,
+      meals (
+        user_days (
+          profile_id
+        )
+      )
+    `,
+    )
+    .eq("id", itemId)
+    .maybeSingle();
+
+  if (readError) {
+    return { error: mapDbError(readError.message) };
+  }
+  if (!row) {
+    return { error: "Запись не найдена." };
+  }
+
+  const mealsRaw = row.meals as
+    | { user_days: { profile_id: string } | { profile_id: string }[] | null }
+    | { user_days: { profile_id: string } | { profile_id: string }[] | null }[]
+    | null;
+  const meals = Array.isArray(mealsRaw) ? mealsRaw[0] : mealsRaw;
+  const userDays = meals?.user_days;
+  const ownerId = Array.isArray(userDays)
+    ? userDays[0]?.profile_id
+    : userDays?.profile_id;
+
+  if (ownerId !== user.id) {
+    return { error: "Нет доступа к этой записи." };
+  }
+
+  const mealId = row.meal_id as string;
+  const itemName = row.name as string;
+
+  const { error: deleteError } = await supabase
+    .from("meal_items")
+    .delete()
+    .eq("id", itemId);
+
+  if (deleteError) {
+    return { error: mapDbError(deleteError.message) };
+  }
+
+  const { count } = await supabase
+    .from("meal_items")
+    .select("id", { count: "exact", head: true })
+    .eq("meal_id", mealId);
+
+  if ((count ?? 0) === 0) {
+    await supabase.from("meals").delete().eq("id", mealId);
+  }
+
+  revalidatePath("/dashboard");
+  revalidatePath("/food");
+  revalidatePath("/schedule", "layout");
+
+  return { success: `Удалено: ${itemName}` };
+}
+
+const per100gFoodSchema = z.object({
+  name: z.string().min(1),
+  grams: z.coerce.number().min(1).max(10000),
+  mealType: z.enum(["breakfast", "main", "dinner", "snack"]).default("snack"),
+  kcalPer100g: z.coerce.number().min(0),
+  proteinPer100g: z.coerce.number().min(0),
+  fatPer100g: z.coerce.number().min(0),
+  carbsPer100g: z.coerce.number().min(0),
+});
+
+async function insertMealItem(params: {
+  name: string;
+  grams: number;
+  kcal: number;
+  proteinG: number;
+  fatG: number;
+  carbsG: number;
+  mealType: string;
+  source: string;
+  barcode?: string | null;
+  offProductId?: string | null;
+}) {
   const supabase = await createClient();
   const {
     data: { user },
@@ -371,24 +509,139 @@ export async function addManualFood(formData: FormData) {
     .insert({
       user_day_id: day.id,
       eaten_at: new Date().toISOString(),
-      meal_type: String(formData.get("mealType") ?? "snack"),
+      meal_type: params.mealType,
     })
     .select("id")
     .single();
 
   await supabase.from("meal_items").insert({
     meal_id: meal!.id,
-    name: String(formData.get("name") ?? "Продукт"),
-    grams: Number(formData.get("grams") ?? 0) || null,
-    kcal: Number(formData.get("kcal") ?? 0),
-    protein_g: Number(formData.get("protein_g") ?? 0),
-    fat_g: Number(formData.get("fat_g") ?? 0),
-    carbs_g: Number(formData.get("carbs_g") ?? 0),
-    source: "manual",
+    name: params.name,
+    grams: params.grams,
+    kcal: params.kcal,
+    protein_g: params.proteinG,
+    fat_g: params.fatG,
+    carbs_g: params.carbsG,
+    source: params.source,
+    barcode: params.barcode ?? null,
+    off_product_id: params.offProductId ?? null,
   });
 
   revalidatePath("/dashboard");
   revalidatePath("/food");
+}
+
+export async function addManualFood(formData: FormData) {
+  const parsed = per100gFoodSchema.safeParse({
+    name: formData.get("name"),
+    grams: formData.get("grams"),
+    mealType: formData.get("mealType") ?? "snack",
+    kcalPer100g: formData.get("kcalPer100g"),
+    proteinPer100g: formData.get("proteinPer100g"),
+    fatPer100g: formData.get("fatPer100g"),
+    carbsPer100g: formData.get("carbsPer100g"),
+  });
+
+  if (!parsed.success) return;
+
+  const scaled = scaleNutrition(
+    {
+      kcalPer100g: parsed.data.kcalPer100g,
+      proteinPer100g: parsed.data.proteinPer100g,
+      fatPer100g: parsed.data.fatPer100g,
+      carbsPer100g: parsed.data.carbsPer100g,
+    },
+    parsed.data.grams,
+  );
+
+  await insertMealItem({
+    name: parsed.data.name,
+    grams: scaled.grams,
+    kcal: scaled.kcal,
+    proteinG: scaled.proteinG,
+    fatG: scaled.fatG,
+    carbsG: scaled.carbsG,
+    mealType: parsed.data.mealType,
+    source: "manual",
+  });
+}
+
+export async function addCommonFood(formData: FormData) {
+  const foodId = String(formData.get("foodId") ?? "");
+  const grams = Number(formData.get("grams") ?? 0);
+  const food = COMMON_FOODS.find((item) => item.id === foodId);
+  if (!food || grams < 1) return;
+
+  const scaled = scaleNutrition(food.per100g, grams);
+  await insertMealItem({
+    name: food.name,
+    grams: scaled.grams,
+    kcal: scaled.kcal,
+    proteinG: scaled.proteinG,
+    fatG: scaled.fatG,
+    carbsG: scaled.carbsG,
+    mealType: "snack",
+    source: "common_food",
+  });
+}
+
+export async function saveUserBarcodeProduct(formData: FormData) {
+  const parsed = per100gFoodSchema
+    .extend({ barcode: z.string().min(6).max(14) })
+    .safeParse({
+      barcode: formData.get("barcode"),
+      name: formData.get("name"),
+      grams: formData.get("grams"),
+      mealType: "snack",
+      kcalPer100g: formData.get("kcalPer100g"),
+      proteinPer100g: formData.get("proteinPer100g"),
+      fatPer100g: formData.get("fatPer100g"),
+      carbsPer100g: formData.get("carbsPer100g"),
+    });
+
+  if (!parsed.success) return;
+
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return;
+
+  await supabase.from("user_barcode_products").upsert(
+    {
+      profile_id: user.id,
+      barcode: parsed.data.barcode,
+      name: parsed.data.name,
+      kcal_per_100g: parsed.data.kcalPer100g,
+      protein_per_100g: parsed.data.proteinPer100g,
+      fat_per_100g: parsed.data.fatPer100g,
+      carbs_per_100g: parsed.data.carbsPer100g,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "profile_id,barcode" },
+  );
+
+  const scaled = scaleNutrition(
+    {
+      kcalPer100g: parsed.data.kcalPer100g,
+      proteinPer100g: parsed.data.proteinPer100g,
+      fatPer100g: parsed.data.fatPer100g,
+      carbsPer100g: parsed.data.carbsPer100g,
+    },
+    parsed.data.grams,
+  );
+
+  await insertMealItem({
+    name: parsed.data.name,
+    grams: scaled.grams,
+    kcal: scaled.kcal,
+    proteinG: scaled.proteinG,
+    fatG: scaled.fatG,
+    carbsG: scaled.carbsG,
+    mealType: "snack",
+    source: "user_barcode",
+    barcode: parsed.data.barcode,
+  });
 }
 
 const DAILY_INSIGHT_LIMIT = 3;
@@ -563,4 +816,150 @@ export async function logActivity(formData: FormData) {
   });
 
   revalidatePath("/dashboard");
+}
+
+const schedulePlanSchema = z.object({
+  dateKey: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  dayTemplateType: z.enum(["night_shift", "recovery", "day_off"]),
+});
+
+export async function setSchedulePlan(
+  _prevState: SchedulePlanState,
+  formData: FormData,
+): Promise<SchedulePlanState> {
+  const parsed = schedulePlanSchema.safeParse({
+    dateKey: formData.get("dateKey"),
+    dayTemplateType: formData.get("dayTemplateType"),
+  });
+  if (!parsed.success) {
+    return { error: "Неверные данные плана." };
+  }
+
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) {
+    return { error: "Нужно войти в аккаунт." };
+  }
+
+  const { error } = await supabase.from("schedule_plans").upsert(
+    {
+      profile_id: user.id,
+      plan_date: parsed.data.dateKey,
+      day_template_type: parsed.data.dayTemplateType,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "profile_id,plan_date" },
+  );
+
+  if (error) {
+    return { error: mapDbError(error.message) };
+  }
+
+  revalidatePath("/schedule");
+  revalidatePath(`/schedule/${parsed.data.dateKey}`);
+  return {
+    success: `План сохранён: ${DAY_TYPE_META[parsed.data.dayTemplateType].label}`,
+  };
+}
+
+export async function clearSchedulePlan(
+  _prevState: SchedulePlanState,
+  formData: FormData,
+): Promise<SchedulePlanState> {
+  const dateKey = String(formData.get("dateKey") ?? "");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
+    return { error: "Неверная дата." };
+  }
+
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) {
+    return { error: "Нужно войти в аккаунт." };
+  }
+
+  const { error } = await supabase
+    .from("schedule_plans")
+    .delete()
+    .eq("profile_id", user.id)
+    .eq("plan_date", dateKey);
+
+  if (error) {
+    return { error: mapDbError(error.message) };
+  }
+
+  revalidatePath("/schedule");
+  revalidatePath(`/schedule/${dateKey}`);
+  return { success: "План снят." };
+}
+
+export async function cycleSchedulePlan(
+  _prevState: SchedulePlanState,
+  formData: FormData,
+): Promise<SchedulePlanState> {
+  const dateKey = String(formData.get("dateKey") ?? "");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
+    return { error: "Неверная дата." };
+  }
+
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) {
+    return { error: "Нужно войти в аккаунт." };
+  }
+
+  const { data: current, error: readError } = await supabase
+    .from("schedule_plans")
+    .select("day_template_type")
+    .eq("profile_id", user.id)
+    .eq("plan_date", dateKey)
+    .maybeSingle();
+
+  if (readError) {
+    return { error: mapDbError(readError.message) };
+  }
+
+  const currentType =
+    (current?.day_template_type as DayTemplateType | undefined) ?? null;
+  const idx = PLAN_CYCLE.indexOf(currentType);
+  const nextType = PLAN_CYCLE[(idx + 1) % PLAN_CYCLE.length];
+
+  if (nextType === null) {
+    const { error } = await supabase
+      .from("schedule_plans")
+      .delete()
+      .eq("profile_id", user.id)
+      .eq("plan_date", dateKey);
+
+    if (error) {
+      return { error: mapDbError(error.message) };
+    }
+
+    revalidatePath("/schedule");
+    revalidatePath(`/schedule/${dateKey}`);
+    return { success: "План снят." };
+  }
+
+  const { error } = await supabase.from("schedule_plans").upsert(
+    {
+      profile_id: user.id,
+      plan_date: dateKey,
+      day_template_type: nextType,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "profile_id,plan_date" },
+  );
+
+  if (error) {
+    return { error: mapDbError(error.message) };
+  }
+
+  revalidatePath("/schedule");
+  revalidatePath(`/schedule/${dateKey}`);
+  return { success: `План: ${DAY_TYPE_META[nextType].label}` };
 }
