@@ -24,8 +24,8 @@ export function CommonFoodsQuickAdd() {
   return (
     <div className="space-y-3">
       <p className="text-sm text-zinc-500">
-        Овощи и фрукты без этикетки — средние значения на 100 г, вес подправь
-        вручную.
+        Протеин, овощи и простые продукты — вес подправь вручную. Средние
+        значения овощей; протеин — с твоей этикетки BioTechUSA.
       </p>
       {COMMON_FOODS.map((food) => {
         const grams = gramsById[food.id] ?? food.defaultGrams;
@@ -59,7 +59,7 @@ export function CommonFoodsQuickAdd() {
               type="button"
               disabled={isPending}
               onClick={() => handleAdd(food.id)}
-              className="min-h-9 rounded-lg bg-emerald-500/15 px-3 text-sm text-emerald-300 disabled:opacity-60"
+              className="btn-interactive min-h-9 rounded-lg bg-emerald-500/15 px-3 text-sm text-emerald-300 hover:bg-emerald-500/25 disabled:opacity-60"
             >
               +
             </button>

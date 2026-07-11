@@ -11,6 +11,18 @@ export type CommonFood = {
 /** Справочные значения (средние, на 100 г). Источник: таблицы химического состава. */
 export const COMMON_FOODS: CommonFood[] = [
   {
+    id: "biotech_pure_whey",
+    name: "BioTechUSA Pure Whey (шоколад-кокос)",
+    defaultGrams: 28,
+    per100g: {
+      kcalPer100g: 382,
+      proteinPer100g: 75,
+      fatPer100g: 6.4,
+      carbsPer100g: 5.4,
+    },
+    hint: "1 порция = 2 ст. ложки (28 г). 250 мл воды — +250 мл на вкладке «День»",
+  },
+  {
     id: "tomato",
     name: "Помидор",
     defaultGrams: 150,

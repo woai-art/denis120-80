@@ -46,7 +46,7 @@ export default async function FoodPage() {
         </section>
 
         <section className="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-4">
-          <h2 className="mb-4 text-lg font-medium">Овощи и простые продукты</h2>
+          <h2 className="mb-4 text-lg font-medium">Быстрое добавление</h2>
           <CommonFoodsQuickAdd />
         </section>
 
