@@ -11,10 +11,11 @@ export function mapDbError(message: string) {
     return "Таблица календаря не создана. Выполни миграцию schedule_plans в Supabase (SQL Editor).";
   }
   if (
-    message.includes("user_barcode_products") &&
-    message.includes("does not exist")
+    (message.includes("user_barcode_products") ||
+      message.includes("user_products")) &&
+    (message.includes("does not exist") || message.includes("schema cache"))
   ) {
-    return "Таблица штрих-кодов не создана. Выполни миграцию в Supabase.";
+    return "Таблица «Мои продукты» не создана. Выполни миграцию user_products в Supabase.";
   }
   return message;
 }

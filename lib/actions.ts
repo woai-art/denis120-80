@@ -21,6 +21,10 @@ import { DAY_TYPE_META } from "@/lib/calendar";
 import { COMMON_FOODS } from "@/lib/common-foods";
 import { scaleNutrition } from "@/lib/nutrition";
 import {
+  getUserProductById,
+  upsertUserProduct,
+} from "@/lib/user-products";
+import {
   DEFAULT_FOOD_TEMPLATES,
   DEFAULT_SCHEDULES,
   type DayTemplateType,
@@ -531,6 +535,54 @@ async function insertMealItem(params: {
   revalidatePath("/food");
 }
 
+async function saveProductAndMeal(params: {
+  name: string;
+  grams: number;
+  kcalPer100g: number;
+  proteinPer100g: number;
+  fatPer100g: number;
+  carbsPer100g: number;
+  mealType: string;
+  source: string;
+  barcode?: string | null;
+  offProductId?: string | null;
+}) {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return;
+
+  const per100g = {
+    kcalPer100g: params.kcalPer100g,
+    proteinPer100g: params.proteinPer100g,
+    fatPer100g: params.fatPer100g,
+    carbsPer100g: params.carbsPer100g,
+  };
+  const scaled = scaleNutrition(per100g, params.grams);
+
+  await insertMealItem({
+    name: params.name,
+    grams: scaled.grams,
+    kcal: scaled.kcal,
+    proteinG: scaled.proteinG,
+    fatG: scaled.fatG,
+    carbsG: scaled.carbsG,
+    mealType: params.mealType,
+    source: params.source,
+    barcode: params.barcode,
+    offProductId: params.offProductId,
+  });
+
+  await upsertUserProduct({
+    profileId: user.id,
+    name: params.name,
+    grams: scaled.grams,
+    per100g,
+    barcode: params.barcode,
+  });
+}
+
 export async function addManualFood(formData: FormData) {
   const parsed = per100gFoodSchema.safeParse({
     name: formData.get("name"),
@@ -544,23 +596,13 @@ export async function addManualFood(formData: FormData) {
 
   if (!parsed.success) return;
 
-  const scaled = scaleNutrition(
-    {
-      kcalPer100g: parsed.data.kcalPer100g,
-      proteinPer100g: parsed.data.proteinPer100g,
-      fatPer100g: parsed.data.fatPer100g,
-      carbsPer100g: parsed.data.carbsPer100g,
-    },
-    parsed.data.grams,
-  );
-
-  await insertMealItem({
+  await saveProductAndMeal({
     name: parsed.data.name,
-    grams: scaled.grams,
-    kcal: scaled.kcal,
-    proteinG: scaled.proteinG,
-    fatG: scaled.fatG,
-    carbsG: scaled.carbsG,
+    grams: parsed.data.grams,
+    kcalPer100g: parsed.data.kcalPer100g,
+    proteinPer100g: parsed.data.proteinPer100g,
+    fatPer100g: parsed.data.fatPer100g,
+    carbsPer100g: parsed.data.carbsPer100g,
     mealType: parsed.data.mealType,
     source: "manual",
   });
@@ -572,16 +614,42 @@ export async function addCommonFood(formData: FormData) {
   const food = COMMON_FOODS.find((item) => item.id === foodId);
   if (!food || grams < 1) return;
 
-  const scaled = scaleNutrition(food.per100g, grams);
-  await insertMealItem({
+  await saveProductAndMeal({
     name: food.name,
-    grams: scaled.grams,
-    kcal: scaled.kcal,
-    proteinG: scaled.proteinG,
-    fatG: scaled.fatG,
-    carbsG: scaled.carbsG,
+    grams,
+    kcalPer100g: food.per100g.kcalPer100g,
+    proteinPer100g: food.per100g.proteinPer100g,
+    fatPer100g: food.per100g.fatPer100g,
+    carbsPer100g: food.per100g.carbsPer100g,
     mealType: "snack",
     source: "common_food",
+  });
+}
+
+export async function addMyProduct(formData: FormData) {
+  const productId = String(formData.get("productId") ?? "");
+  const grams = Number(formData.get("grams") ?? 0);
+  if (!productId || grams < 1) return;
+
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return;
+
+  const product = await getUserProductById(user.id, productId);
+  if (!product) return;
+
+  await saveProductAndMeal({
+    name: product.name,
+    grams,
+    kcalPer100g: product.per100g.kcalPer100g,
+    proteinPer100g: product.per100g.proteinPer100g,
+    fatPer100g: product.per100g.fatPer100g,
+    carbsPer100g: product.per100g.carbsPer100g,
+    mealType: "snack",
+    source: "my_product",
+    barcode: product.barcode,
   });
 }
 
@@ -601,43 +669,13 @@ export async function saveUserBarcodeProduct(formData: FormData) {
 
   if (!parsed.success) return;
 
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) return;
-
-  await supabase.from("user_barcode_products").upsert(
-    {
-      profile_id: user.id,
-      barcode: parsed.data.barcode,
-      name: parsed.data.name,
-      kcal_per_100g: parsed.data.kcalPer100g,
-      protein_per_100g: parsed.data.proteinPer100g,
-      fat_per_100g: parsed.data.fatPer100g,
-      carbs_per_100g: parsed.data.carbsPer100g,
-      updated_at: new Date().toISOString(),
-    },
-    { onConflict: "profile_id,barcode" },
-  );
-
-  const scaled = scaleNutrition(
-    {
-      kcalPer100g: parsed.data.kcalPer100g,
-      proteinPer100g: parsed.data.proteinPer100g,
-      fatPer100g: parsed.data.fatPer100g,
-      carbsPer100g: parsed.data.carbsPer100g,
-    },
-    parsed.data.grams,
-  );
-
-  await insertMealItem({
+  await saveProductAndMeal({
     name: parsed.data.name,
-    grams: scaled.grams,
-    kcal: scaled.kcal,
-    proteinG: scaled.proteinG,
-    fatG: scaled.fatG,
-    carbsG: scaled.carbsG,
+    grams: parsed.data.grams,
+    kcalPer100g: parsed.data.kcalPer100g,
+    proteinPer100g: parsed.data.proteinPer100g,
+    fatPer100g: parsed.data.fatPer100g,
+    carbsPer100g: parsed.data.carbsPer100g,
     mealType: "snack",
     source: "user_barcode",
     barcode: parsed.data.barcode,
@@ -745,48 +783,18 @@ export async function addOffFood(formData: FormData) {
 
   if (!parsed.success) return;
 
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) return;
-
-  const { data: day } = await supabase
-    .from("user_days")
-    .select("id")
-    .eq("profile_id", user.id)
-    .is("closed_at", null)
-    .maybeSingle();
-
-  if (!day) return;
-
-  const factor = parsed.data.grams / 100;
-
-  const { data: meal } = await supabase
-    .from("meals")
-    .insert({
-      user_day_id: day.id,
-      eaten_at: new Date().toISOString(),
-      meal_type: "snack",
-    })
-    .select("id")
-    .single();
-
-  await supabase.from("meal_items").insert({
-    meal_id: meal!.id,
+  await saveProductAndMeal({
     name: parsed.data.name,
     grams: parsed.data.grams,
-    kcal: Math.round(parsed.data.kcalPer100g * factor),
-    protein_g: Number((parsed.data.proteinPer100g * factor).toFixed(1)),
-    fat_g: Number((parsed.data.fatPer100g * factor).toFixed(1)),
-    carbs_g: Number((parsed.data.carbsPer100g * factor).toFixed(1)),
+    kcalPer100g: parsed.data.kcalPer100g,
+    proteinPer100g: parsed.data.proteinPer100g,
+    fatPer100g: parsed.data.fatPer100g,
+    carbsPer100g: parsed.data.carbsPer100g,
+    mealType: "snack",
     source: parsed.data.barcode ? "barcode" : "open_food_facts",
     barcode: parsed.data.barcode ?? null,
-    off_product_id: parsed.data.offProductId ?? null,
+    offProductId: parsed.data.offProductId ?? null,
   });
-
-  revalidatePath("/dashboard");
-  revalidatePath("/food");
 }
 
 export async function logActivity(formData: FormData) {

@@ -124,7 +124,7 @@ export async function getUserBarcodeProduct(
 ): Promise<OffProduct | null> {
   const supabase = await createClient();
   const { data } = await supabase
-    .from("user_barcode_products")
+    .from("user_products")
     .select("*")
     .eq("profile_id", profileId)
     .eq("barcode", barcode)
@@ -141,7 +141,7 @@ export async function getUserBarcodeProduct(
     proteinPer100g: Number(data.protein_per_100g),
     fatPer100g: Number(data.fat_per_100g),
     carbsPer100g: Number(data.carbs_per_100g),
-    source: "user_barcode",
+    source: "user_saved",
   };
 }
 
