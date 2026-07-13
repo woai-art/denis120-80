@@ -138,3 +138,36 @@ export async function getUserProductById(
     lastUsedAt: data.last_used_at as string,
   };
 }
+
+export async function getUserProductByNameKey(
+  profileId: string,
+  name: string,
+): Promise<UserProduct | null> {
+  const supabase = await createClient();
+  const nameKey = productNameKey(name);
+  if (!nameKey) return null;
+
+  const { data } = await supabase
+    .from("user_products")
+    .select("*")
+    .eq("profile_id", profileId)
+    .eq("name_key", nameKey)
+    .maybeSingle();
+
+  if (!data) return null;
+
+  return {
+    id: data.id as string,
+    name: data.name as string,
+    barcode: (data.barcode as string | null) ?? null,
+    defaultGrams: Number(data.default_grams) || 100,
+    per100g: {
+      kcalPer100g: Number(data.kcal_per_100g),
+      proteinPer100g: Number(data.protein_per_100g),
+      fatPer100g: Number(data.fat_per_100g),
+      carbsPer100g: Number(data.carbs_per_100g),
+    },
+    lastUsedAt: data.last_used_at as string,
+  };
+}
+

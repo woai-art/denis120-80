@@ -4,6 +4,7 @@ import { cn } from "@/lib/utils";
 const links = [
   { href: "/dashboard", label: "День" },
   { href: "/food", label: "Питание" },
+  { href: "/pantry", label: "Запас" },
   { href: "/schedule", label: "Календарь" },
   { href: "/progress", label: "Прогресс" },
   { href: "/settings", label: "Настройки" },

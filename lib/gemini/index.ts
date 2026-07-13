@@ -49,7 +49,17 @@ export type DayContext = {
   }[];
 };
 
-async function callGemini(prompt: string): Promise<unknown> {
+async function callGemini(
+  prompt: string,
+  options?: { temperature?: number; maxOutputTokens?: number },
+): Promise<unknown> {
+  return callGeminiParts([{ text: prompt }], options);
+}
+
+async function callGeminiParts(
+  parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }>,
+  options?: { temperature?: number; maxOutputTokens?: number },
+): Promise<unknown> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error("GEMINI_API_KEY is not configured");
@@ -59,11 +69,11 @@ async function callGemini(prompt: string): Promise<unknown> {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
+      contents: [{ parts }],
       generationConfig: {
         responseMimeType: "application/json",
-        temperature: 0.7,
-        maxOutputTokens: 1024,
+        temperature: options?.temperature ?? 0.7,
+        maxOutputTokens: options?.maxOutputTokens ?? 1024,
       },
     }),
   });
@@ -132,4 +142,57 @@ JSON-схема:
 
   const raw = await callGemini(prompt);
   return menuSchema.parse(raw);
+}
+
+export const receiptSchema = z.object({
+  store: z.string().max(120).optional().nullable(),
+  items: z
+    .array(
+      z.object({
+        name: z.string().min(1).max(200),
+        grams: z.number().min(0).max(100000).optional().nullable(),
+        price_byn: z.number().min(0).max(100000).optional().nullable(),
+      }),
+    )
+    .min(1)
+    .max(80),
+});
+
+export type ReceiptParseResult = z.infer<typeof receiptSchema>;
+
+const RECEIPT_PROMPT = `Ты разбираешь белорусский/российский кассовый чек магазина продуктов.
+Верни только JSON:
+{"store": "название магазина или null", "items": [{"name": "товар", "grams": число_или_null, "price_byn": число_в_BYN}]}
+
+Правила:
+- Цены в белорусских рублях (BYN). Если в чеке копейки — переведи в BYN (например 2,49 → 2.49).
+- grams: если указан вес (кг/г) — приведи к граммам. 0.3 кг → 300. Если вес неясен — null.
+- Пропускай сдачу, итог, НДС, номер чека, карты — только товары.
+- name — короткое понятное название на русском.`;
+
+export async function parseReceiptText(text: string): Promise<ReceiptParseResult> {
+  const raw = await callGemini(
+    `${RECEIPT_PROMPT}\n\nТекст чека:\n${text.slice(0, 8000)}`,
+    { temperature: 0.2, maxOutputTokens: 2048 },
+  );
+  return receiptSchema.parse(raw);
+}
+
+export async function parseReceiptImage(params: {
+  mimeType: string;
+  base64: string;
+}): Promise<ReceiptParseResult> {
+  const raw = await callGeminiParts(
+    [
+      { text: RECEIPT_PROMPT },
+      {
+        inlineData: {
+          mimeType: params.mimeType,
+          data: params.base64,
+        },
+      },
+    ],
+    { temperature: 0.2, maxOutputTokens: 2048 },
+  );
+  return receiptSchema.parse(raw);
 }

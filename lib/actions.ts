@@ -13,15 +13,20 @@ import { buildDayContext } from "@/lib/data";
 import {
   generateDailyInsight,
   generateMenuSuggestion,
+  parseReceiptImage,
+  parseReceiptText,
   PROMPT_VERSION,
+  type ReceiptParseResult,
 } from "@/lib/gemini";
 import { getAppUrl } from "@/lib/app-url";
 import { mapDbError, type ActionState } from "@/lib/action-result";
 import { DAY_TYPE_META } from "@/lib/calendar";
 import { COMMON_FOODS } from "@/lib/common-foods";
 import { scaleNutrition } from "@/lib/nutrition";
+import { recordPurchase } from "@/lib/pantry";
 import {
   getUserProductById,
+  getUserProductByNameKey,
   upsertUserProduct,
 } from "@/lib/user-products";
 import {
@@ -1105,4 +1110,414 @@ export async function cycleSchedulePlan(
   revalidatePath("/schedule");
   revalidatePath(`/schedule/${dateKey}`);
   return { success: `План: ${DAY_TYPE_META[nextType].label}` };
+}
+
+const RECEIPT_PARSE_LIMIT = 5;
+
+const purchaseItemSchema = z.object({
+  name: z.string().min(1).max(200),
+  grams: z.coerce.number().min(1).max(100000),
+  priceByn: z.coerce.number().min(0).max(100000),
+});
+
+export type ReceiptParseState = ActionState & {
+  store?: string | null;
+  items?: Array<{ name: string; grams: number; priceByn: number }>;
+};
+
+async function assertReceiptParseAllowed(profileId: string) {
+  const supabase = await createClient();
+  const since = new Date();
+  since.setHours(0, 0, 0, 0);
+
+  const { count } = await supabase
+    .from("ai_insights")
+    .select("id", { count: "exact", head: true })
+    .eq("profile_id", profileId)
+    .eq("insight_type", "receipt_parse")
+    .gte("created_at", since.toISOString());
+
+  if ((count ?? 0) >= RECEIPT_PARSE_LIMIT) {
+    throw new Error("Лимит разбора чеков на сегодня (5). Добавь покупку вручную.");
+  }
+}
+
+async function logReceiptParse(profileId: string, meta: object) {
+  const supabase = await createClient();
+  await supabase.from("ai_insights").insert({
+    profile_id: profileId,
+    user_day_id: null,
+    insight_type: "receipt_parse",
+    content_json: meta,
+    prompt_version: PROMPT_VERSION,
+  });
+}
+
+function normalizeReceiptItems(parsed: ReceiptParseResult) {
+  return parsed.items.map((item) => ({
+    name: item.name.trim(),
+    grams: item.grams && item.grams > 0 ? Math.round(item.grams) : 100,
+    priceByn: Number((item.price_byn ?? 0).toFixed(2)),
+  }));
+}
+
+export async function addManualPurchase(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return { error: "Нужно войти в аккаунт." };
+
+  const parsed = purchaseItemSchema.safeParse({
+    name: formData.get("name"),
+    grams: formData.get("grams"),
+    priceByn: formData.get("priceByn"),
+  });
+  if (!parsed.success) {
+    return { error: "Проверь название, граммы и цену." };
+  }
+
+  try {
+    const result = await recordPurchase({
+      profileId: user.id,
+      source: "manual",
+      items: [parsed.data],
+    });
+    revalidatePath("/pantry");
+    revalidatePath("/food");
+    return {
+      success: `В запас: ${parsed.data.name} (${parsed.data.grams} г, ${result.totalByn.toFixed(2)} BYN)`,
+    };
+  } catch (error) {
+    return {
+      error: mapDbError(
+        error instanceof Error ? error.message : "Ошибка сохранения покупки",
+      ),
+    };
+  }
+}
+
+export async function confirmReceiptImport(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return { error: "Нужно войти в аккаунт." };
+
+  const sourceRaw = String(formData.get("source") ?? "receipt_text");
+  const source =
+    sourceRaw === "receipt_photo" ? "receipt_photo" : "receipt_text";
+  const storeName = String(formData.get("storeName") ?? "").trim() || null;
+  const payload = String(formData.get("itemsJson") ?? "");
+
+  let items: Array<{ name: string; grams: number; priceByn: number }>;
+  try {
+    const raw = JSON.parse(payload) as unknown;
+    const parsed = z.array(purchaseItemSchema).min(1).max(80).safeParse(raw);
+    if (!parsed.success) {
+      return { error: "Некорректный список товаров." };
+    }
+    items = parsed.data;
+  } catch {
+    return { error: "Некорректный список товаров." };
+  }
+
+  try {
+    const result = await recordPurchase({
+      profileId: user.id,
+      source,
+      storeName,
+      items,
+    });
+    revalidatePath("/pantry");
+    revalidatePath("/food");
+    return {
+      success: `Чек в холодильнике: ${items.length} поз., ${result.totalByn.toFixed(2)} BYN`,
+    };
+  } catch (error) {
+    return {
+      error: mapDbError(
+        error instanceof Error ? error.message : "Ошибка импорта чека",
+      ),
+    };
+  }
+}
+
+export async function parseReceiptTextAction(
+  _prev: ReceiptParseState,
+  formData: FormData,
+): Promise<ReceiptParseState> {
+  const text = String(formData.get("receiptText") ?? "").trim();
+  if (text.length < 10) {
+    return { error: "Вставь текст чека (хотя бы несколько строк)." };
+  }
+
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return { error: "Нужно войти в аккаунт." };
+
+  try {
+    await assertReceiptParseAllowed(user.id);
+    const parsed = await parseReceiptText(text);
+    await logReceiptParse(user.id, { source: "text", itemCount: parsed.items.length });
+    return {
+      success: "Чек разобран — проверь позиции и сохрани.",
+      store: parsed.store ?? null,
+      items: normalizeReceiptItems(parsed),
+    };
+  } catch (error) {
+    return {
+      error:
+        error instanceof Error
+          ? mapDbError(error.message)
+          : "Не удалось разобрать чек",
+    };
+  }
+}
+
+export async function parseReceiptImageAction(
+  _prev: ReceiptParseState,
+  formData: FormData,
+): Promise<ReceiptParseState> {
+  const mimeType = String(formData.get("mimeType") ?? "");
+  const base64 = String(formData.get("base64") ?? "");
+  if (!mimeType.startsWith("image/") || base64.length < 100) {
+    return { error: "Загрузи фото чека (JPG/PNG)." };
+  }
+  if (base64.length > 4_000_000) {
+    return { error: "Фото слишком большое. Сделай снимок поменьше." };
+  }
+
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return { error: "Нужно войти в аккаунт." };
+
+  try {
+    await assertReceiptParseAllowed(user.id);
+    const parsed = await parseReceiptImage({ mimeType, base64 });
+    await logReceiptParse(user.id, {
+      source: "photo",
+      itemCount: parsed.items.length,
+    });
+    return {
+      success: "Чек разобран — проверь позиции и сохрани.",
+      store: parsed.store ?? null,
+      items: normalizeReceiptItems(parsed),
+    };
+  } catch (error) {
+    return {
+      error:
+        error instanceof Error
+          ? mapDbError(error.message)
+          : "Не удалось разобрать фото чека",
+    };
+  }
+}
+
+export async function adjustPantryItem(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const itemId = String(formData.get("itemId") ?? "");
+  const gramsLeft = Number(formData.get("gramsLeft") ?? NaN);
+  if (!itemId || !Number.isFinite(gramsLeft) || gramsLeft < 0) {
+    return { error: "Неверные граммы остатка." };
+  }
+
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return { error: "Нужно войти в аккаунт." };
+
+  if (gramsLeft === 0) {
+    const { error } = await supabase
+      .from("pantry_items")
+      .delete()
+      .eq("id", itemId)
+      .eq("profile_id", user.id);
+    if (error) return { error: mapDbError(error.message) };
+    revalidatePath("/pantry");
+    revalidatePath("/food");
+    return { success: "Позиция убрана из запаса." };
+  }
+
+  const { error } = await supabase
+    .from("pantry_items")
+    .update({
+      grams_left: gramsLeft,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", itemId)
+    .eq("profile_id", user.id);
+
+  if (error) return { error: mapDbError(error.message) };
+  revalidatePath("/pantry");
+  revalidatePath("/food");
+  return { success: `Остаток обновлён: ${gramsLeft} г` };
+}
+
+export async function deletePantryItem(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const itemId = String(formData.get("itemId") ?? "");
+  if (!itemId) return { error: "Позиция не найдена." };
+
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return { error: "Нужно войти в аккаунт." };
+
+  const { error } = await supabase
+    .from("pantry_items")
+    .delete()
+    .eq("id", itemId)
+    .eq("profile_id", user.id);
+
+  if (error) return { error: mapDbError(error.message) };
+  revalidatePath("/pantry");
+  revalidatePath("/food");
+  return { success: "Удалено из запаса." };
+}
+
+export type EatFromPantryState = ActionState & {
+  needsNutrition?: boolean;
+  pantryItemId?: string;
+  productName?: string;
+  grams?: number;
+  mealType?: string;
+};
+
+export async function eatFromPantry(
+  _prev: EatFromPantryState,
+  formData: FormData,
+): Promise<EatFromPantryState> {
+  const pantryItemId = String(formData.get("pantryItemId") ?? "");
+  const grams = Number(formData.get("grams") ?? 0);
+  const mealTypeParsed = mealTypeSchema.safeParse(
+    formData.get("mealType") ?? "snack",
+  );
+  const mealType = mealTypeParsed.success ? mealTypeParsed.data : "snack";
+
+  const hasNutritionSubmit =
+    formData.get("kcalPer100g") != null &&
+    String(formData.get("kcalPer100g")) !== "";
+
+  if (!pantryItemId || grams < 1) {
+    return { error: "Укажи продукт и граммы." };
+  }
+
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return { error: "Нужно войти в аккаунт." };
+
+  const { data: pantry, error: pantryError } = await supabase
+    .from("pantry_items")
+    .select("id, name, grams_left, user_product_id")
+    .eq("id", pantryItemId)
+    .eq("profile_id", user.id)
+    .maybeSingle();
+
+  if (pantryError) return { error: mapDbError(pantryError.message) };
+  if (!pantry) return { error: "Позиция не найдена в запасе." };
+
+  const left = Number(pantry.grams_left);
+  if (grams > left) {
+    return { error: `В запасе только ${left} г.` };
+  }
+
+  let product = pantry.user_product_id
+    ? await getUserProductById(user.id, pantry.user_product_id as string)
+    : await getUserProductByNameKey(user.id, pantry.name as string);
+
+  if (!product && hasNutritionSubmit) {
+    await upsertUserProduct({
+      profileId: user.id,
+      name: pantry.name as string,
+      grams,
+      per100g: {
+        kcalPer100g: Number(formData.get("kcalPer100g")),
+        proteinPer100g: Number(formData.get("proteinPer100g") ?? 0),
+        fatPer100g: Number(formData.get("fatPer100g") ?? 0),
+        carbsPer100g: Number(formData.get("carbsPer100g") ?? 0),
+      },
+    });
+    product = await getUserProductByNameKey(user.id, pantry.name as string);
+  }
+
+  if (!product) {
+    return {
+      needsNutrition: true,
+      pantryItemId,
+      productName: pantry.name as string,
+      grams,
+      mealType,
+      error: "Нет БЖУ для этого продукта — введи значения на 100 г.",
+    };
+  }
+
+  const { data: openDay } = await supabase
+    .from("user_days")
+    .select("id")
+    .eq("profile_id", user.id)
+    .is("closed_at", null)
+    .maybeSingle();
+
+  if (!openDay) {
+    return {
+      error: "Сначала нажми «Проснулся» на вкладке «День».",
+    };
+  }
+
+  await saveProductAndMeal({
+    name: product.name,
+    grams,
+    kcalPer100g: product.per100g.kcalPer100g,
+    proteinPer100g: product.per100g.proteinPer100g,
+    fatPer100g: product.per100g.fatPer100g,
+    carbsPer100g: product.per100g.carbsPer100g,
+    mealType,
+    source: "pantry",
+    barcode: product.barcode,
+  });
+
+  const remaining = Number((left - grams).toFixed(1));
+  if (remaining <= 0) {
+    await supabase
+      .from("pantry_items")
+      .delete()
+      .eq("id", pantryItemId)
+      .eq("profile_id", user.id);
+  } else {
+    await supabase
+      .from("pantry_items")
+      .update({
+        grams_left: remaining,
+        user_product_id: product.id,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", pantryItemId)
+      .eq("profile_id", user.id);
+  }
+
+  revalidatePath("/pantry");
+  revalidatePath("/food");
+  revalidatePath("/dashboard");
+  return {
+    success: `Съедено из запаса: ${product.name} ${grams} г. Осталось ${Math.max(0, remaining)} г.`,
+  };
 }

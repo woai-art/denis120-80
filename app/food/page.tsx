@@ -1,19 +1,22 @@
 import { AppNav } from "@/components/app-nav";
 import { CommonFoodsQuickAdd } from "@/components/common-foods-quick-add";
+import { EatFromPantry } from "@/components/eat-from-pantry";
 import { FoodSearch } from "@/components/food-search";
 import { ManualFoodForm } from "@/components/manual-food-form";
 import { MyProductsQuickAdd } from "@/components/my-products-quick-add";
 import { addFoodTemplate } from "@/lib/actions";
 import { getCurrentProfile, getFoodTemplates } from "@/lib/data";
+import { getPantryItems } from "@/lib/pantry";
 import { getMyProducts } from "@/lib/user-products";
 
 export default async function FoodPage() {
   const profile = await getCurrentProfile();
   if (!profile) return null;
 
-  const [templates, myProducts] = await Promise.all([
+  const [templates, myProducts, pantryItems] = await Promise.all([
     getFoodTemplates(profile.id),
     getMyProducts(profile.id),
+    getPantryItems(profile.id),
   ]);
 
   return (
@@ -28,6 +31,11 @@ export default async function FoodPage() {
             если день ещё не начат.
           </p>
         </header>
+
+        <section className="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-4">
+          <h2 className="mb-4 text-lg font-medium">Из холодильника</h2>
+          <EatFromPantry items={pantryItems} />
+        </section>
 
         <section className="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-4">
           <h2 className="mb-4 text-lg font-medium">Мои продукты</h2>
