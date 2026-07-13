@@ -471,6 +471,138 @@ export async function deleteMealItem(
   return { success: `Удалено: ${itemName}` };
 }
 
+const mealTypeSchema = z.enum(["breakfast", "main", "dinner", "snack"]);
+
+const MEAL_TYPE_LABELS: Record<string, string> = {
+  breakfast: "Завтрак",
+  main: "Обед",
+  dinner: "Ужин",
+  snack: "Перекус",
+};
+
+export async function updateMealItem(
+  _prevState: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const itemId = String(formData.get("itemId") ?? "");
+  const mealTypeParsed = mealTypeSchema.safeParse(formData.get("mealType"));
+  const gramsRaw = formData.get("grams");
+  const grams =
+    gramsRaw === null || gramsRaw === ""
+      ? null
+      : Number(gramsRaw);
+
+  if (!itemId) {
+    return { error: "Запись не найдена." };
+  }
+  if (!mealTypeParsed.success) {
+    return { error: "Неверный тип приёма пищи." };
+  }
+  if (grams !== null && (!Number.isFinite(grams) || grams < 1)) {
+    return { error: "Граммы должны быть больше 0." };
+  }
+
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) {
+    return { error: "Нужно войти в аккаунт." };
+  }
+
+  const { data: row, error: readError } = await supabase
+    .from("meal_items")
+    .select(
+      `
+      id,
+      meal_id,
+      name,
+      grams,
+      kcal,
+      protein_g,
+      fat_g,
+      carbs_g,
+      meals (
+        user_days (
+          profile_id
+        )
+      )
+    `,
+    )
+    .eq("id", itemId)
+    .maybeSingle();
+
+  if (readError) {
+    return { error: mapDbError(readError.message) };
+  }
+  if (!row) {
+    return { error: "Запись не найдена." };
+  }
+
+  const mealsRaw = row.meals as
+    | { user_days: { profile_id: string } | { profile_id: string }[] | null }
+    | { user_days: { profile_id: string } | { profile_id: string }[] | null }[]
+    | null;
+  const meals = Array.isArray(mealsRaw) ? mealsRaw[0] : mealsRaw;
+  const userDays = meals?.user_days;
+  const ownerId = Array.isArray(userDays)
+    ? userDays[0]?.profile_id
+    : userDays?.profile_id;
+
+  if (ownerId !== user.id) {
+    return { error: "Нет доступа к этой записи." };
+  }
+
+  const mealId = row.meal_id as string;
+  const mealType = mealTypeParsed.data;
+
+  const { error: mealError } = await supabase
+    .from("meals")
+    .update({ meal_type: mealType })
+    .eq("id", mealId);
+
+  if (mealError) {
+    return { error: mapDbError(mealError.message) };
+  }
+
+  if (grams !== null) {
+    const oldGrams = Number(row.grams);
+    if (oldGrams > 0 && grams !== oldGrams) {
+      const factor = grams / oldGrams;
+      const { error: itemError } = await supabase
+        .from("meal_items")
+        .update({
+          grams,
+          kcal: Math.round(Number(row.kcal) * factor),
+          protein_g: Number((Number(row.protein_g) * factor).toFixed(1)),
+          fat_g: Number((Number(row.fat_g) * factor).toFixed(1)),
+          carbs_g: Number((Number(row.carbs_g) * factor).toFixed(1)),
+        })
+        .eq("id", itemId);
+
+      if (itemError) {
+        return { error: mapDbError(itemError.message) };
+      }
+    } else if (!(oldGrams > 0)) {
+      const { error: itemError } = await supabase
+        .from("meal_items")
+        .update({ grams })
+        .eq("id", itemId);
+      if (itemError) {
+        return { error: mapDbError(itemError.message) };
+      }
+    }
+  }
+
+  revalidatePath("/dashboard");
+  revalidatePath("/food");
+  revalidatePath("/schedule", "layout");
+
+  return {
+    success: `Сохранено: ${row.name as string} → ${MEAL_TYPE_LABELS[mealType]}`,
+  };
+}
+
 const per100gFoodSchema = z.object({
   name: z.string().min(1),
   grams: z.coerce.number().min(1).max(10000),
@@ -629,6 +761,9 @@ export async function addCommonFood(formData: FormData) {
 export async function addMyProduct(formData: FormData) {
   const productId = String(formData.get("productId") ?? "");
   const grams = Number(formData.get("grams") ?? 0);
+  const mealTypeParsed = mealTypeSchema.safeParse(
+    formData.get("mealType") ?? "snack",
+  );
   if (!productId || grams < 1) return;
 
   const supabase = await createClient();
@@ -647,7 +782,7 @@ export async function addMyProduct(formData: FormData) {
     proteinPer100g: product.per100g.proteinPer100g,
     fatPer100g: product.per100g.fatPer100g,
     carbsPer100g: product.per100g.carbsPer100g,
-    mealType: "snack",
+    mealType: mealTypeParsed.success ? mealTypeParsed.data : "snack",
     source: "my_product",
     barcode: product.barcode,
   });

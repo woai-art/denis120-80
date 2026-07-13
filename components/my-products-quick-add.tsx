@@ -5,10 +5,18 @@ import { addMyProduct } from "@/lib/actions";
 import { scaleNutrition } from "@/lib/nutrition";
 import type { UserProduct } from "@/lib/user-products";
 
+const MEAL_TYPES = [
+  { value: "breakfast", label: "Завтрак" },
+  { value: "main", label: "Обед" },
+  { value: "dinner", label: "Ужин" },
+  { value: "snack", label: "Перекус" },
+] as const;
+
 export function MyProductsQuickAdd({ products }: { products: UserProduct[] }) {
   const [gramsById, setGramsById] = useState<Record<string, number>>(() =>
     Object.fromEntries(products.map((p) => [p.id, p.defaultGrams])),
   );
+  const [mealType, setMealType] = useState<string>("main");
   const [isPending, startTransition] = useTransition();
   const [addedId, setAddedId] = useState<string | null>(null);
 
@@ -28,6 +36,7 @@ export function MyProductsQuickAdd({ products }: { products: UserProduct[] }) {
     const formData = new FormData();
     formData.set("productId", productId);
     formData.set("grams", String(grams));
+    formData.set("mealType", mealType);
     startTransition(async () => {
       await addMyProduct(formData);
       setAddedId(productId);
@@ -38,9 +47,22 @@ export function MyProductsQuickAdd({ products }: { products: UserProduct[] }) {
   return (
     <div className="space-y-3">
       <p className="text-sm text-zinc-500">
-        Всё, что уже вводил — здесь. Меняй граммы и жми +. Штрих-код тоже
-        сохраняется: следующий скан найдёт продукт сразу.
+        Всё, что уже вводил — здесь. Выбери приём пищи, граммы и жми +.
       </p>
+      <label className="flex flex-wrap items-center gap-2 text-sm text-zinc-400">
+        Приём пищи
+        <select
+          value={mealType}
+          onChange={(e) => setMealType(e.target.value)}
+          className="btn-interactive min-h-9 rounded-lg border border-zinc-700 bg-zinc-950 px-2 text-zinc-100 hover:border-zinc-500"
+        >
+          {MEAL_TYPES.map((type) => (
+            <option key={type.value} value={type.value}>
+              {type.label}
+            </option>
+          ))}
+        </select>
+      </label>
       {products.map((product) => {
         const grams = gramsById[product.id] ?? product.defaultGrams;
         const preview = scaleNutrition(product.per100g, grams);
